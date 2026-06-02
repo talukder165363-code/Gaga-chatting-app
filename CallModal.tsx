@@ -1,106 +1,85 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { PhoneOff, Mic, MicOff, Camera, CameraOff, Volume2, RotateCcw, Phone } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { PhoneOff, Mic, MicOff, Camera, CameraOff, Volume2, RotateCcw } from 'lucide-react';
 import type { User } from '@/types';
 import { cn } from '@/lib/utils';
-import { toast } from 'sonner';
-import { db, doc, updateDoc, onSnapshot, serverTimestamp } from '@/lib/firebase';
+import { WebRTCCall, type CallState } from '@/lib/webrtc';
+import { useAuth } from '@/hooks/useAuth';
+
 
 interface CallModalProps {
   user: User;
   type: 'voice' | 'video';
-  callDocId: string;
-  isIncoming: boolean;
   onEnd: (duration?: number) => void;
+  callDocId?: string; // If answering an incoming call
+  isIncoming?: boolean;
 }
 
-const CallModal = ({ user, type, callDocId, isIncoming, onEnd }: CallModalProps) => {
-  const [callState, setCallState] = useState<'ringing' | 'connected' | 'ended' | 'busy' | 'missed'>('ringing');
+const CallModal = ({ user, type, onEnd, callDocId, isIncoming = false }: CallModalProps) => {
+  const { user: authUser } = useAuth();
+  const currentUserId = authUser?.id;
+  const [callState, setCallState] = useState<CallState>(isIncoming ? 'ringing' : 'calling');
   const [duration, setDuration] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [isSpeakerOn, setIsSpeakerOn] = useState(false);
   const [isFrontCamera, setIsFrontCamera] = useState(true);
   const endedRef = useRef(false);
-  const ringtoneRef = useRef<HTMLAudioElement | null>(null);
+  const webrtcRef = useRef<WebRTCCall | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const startTimeRef = useRef<number>(0);
 
   useEffect(() => {
-    // Setup ringtone
-    const ringtone = new Audio(isIncoming ? '/sounds/incoming-ring.mp3' : '/sounds/outgoing-ring.mp3');
-    ringtone.loop = true;
-    ringtoneRef.current = ringtone;
+    if (!currentUserId) return;
 
-    if (callState === 'ringing') {
-      ringtone.play().catch(() => {
-        if (import.meta.env.DEV) console.log('Autoplay blocked');
-      });
-    }
+    const handleStateChange = (state: CallState) => {
+      setCallState(state);
+      if (state === 'connected') {
+        startTimeRef.current = Date.now();
+      }
+    };
+
+    const handleRemoteStream = (stream: MediaStream) => {
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = stream;
+      }
+    };
+
+    const handleLocalStream = (stream: MediaStream) => {
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+      }
+    };
+
+    webrtcRef.current = new WebRTCCall(
+      currentUserId,
+      user.id,
+      type === 'video',
+      handleStateChange,
+      handleRemoteStream,
+      handleLocalStream
+    );
+
+    const initializeCall = async () => {
+      if (!webrtcRef.current) return;
+
+      if (callDocId) {
+        if (isIncoming) {
+          await webrtcRef.current.answerCall(callDocId);
+        } else {
+          await webrtcRef.current.startCall(callDocId);
+        }
+      } else {
+        await webrtcRef.current.startCall();
+      }
+    };
+
+    initializeCall();
 
     return () => {
-      ringtone.pause();
-      ringtoneRef.current = null;
+      webrtcRef.current?.endCall();
     };
-  }, [isIncoming, callState]);
-
-  useEffect(() => {
-    if (callState !== 'ringing' && ringtoneRef.current) {
-      ringtoneRef.current.pause();
-    }
-  }, [callState]);
-
-  // Sync with Firestore signaling
-  const handleEndLocal = useCallback(
-    (finalState: 'ended' | 'missed' | 'busy') => {
-      if (endedRef.current) return;
-      endedRef.current = true;
-      setCallState(finalState);
-
-      // Play end sound
-      const endSound = new Audio('/sounds/call-end.mp3');
-      endSound.play().catch(() => { });
-
-      setTimeout(() => onEnd(duration), 1500);
-    },
-    [duration, onEnd]
-  );
-
-  useEffect(() => {
-    if (!callDocId) return;
-
-    const unsub = onSnapshot(doc(db, 'calls', callDocId), (snap: unknown) => {
-      const callSnapshot = snap as { exists: () => boolean; data: () => Record<string, unknown> };
-      if (!callSnapshot.exists()) {
-        handleEndLocal('ended');
-        return;
-      }
-      const data = callSnapshot.data();
-      if (data.status === 'ended' || data.status === 'rejected') {
-        handleEndLocal('ended');
-      } else if (data.status === 'missed') {
-        handleEndLocal('missed');
-      } else if (data.status === 'busy') {
-        handleEndLocal('busy');
-      } else if (data.status === 'connected') {
-        setCallState('connected');
-      }
-    });
-
-    return () => unsub();
-  }, [callDocId, handleEndLocal]);
-
-  // Timeout for missed call
-  useEffect(() => {
-    if (callState === 'ringing' && !isIncoming) {
-      const timeout = setTimeout(async () => {
-        try {
-          await updateDoc(doc(db, 'calls', callDocId), { status: 'missed', endedAt: serverTimestamp() });
-          handleEndLocal('missed');
-        } catch {
-          handleEndLocal('missed');
-        }
-      }, 45000); // 45 seconds timeout
-      return () => clearTimeout(timeout);
-    }
-  }, [callState, isIncoming, callDocId, handleEndLocal]);
+  }, [currentUserId, user.id, type, isIncoming, callDocId]);
 
   useEffect(() => {
     if (callState !== 'connected') return;
@@ -116,45 +95,30 @@ const CallModal = ({ user, type, callDocId, isIncoming, onEnd }: CallModalProps)
     return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
   };
 
-  const handleEndCall = async () => {
+  const handleEnd = () => {
     if (endedRef.current) return;
-    try {
-      await updateDoc(doc(db, 'calls', callDocId), {
-        status: 'ended',
-        duration,
-        endedAt: serverTimestamp(),
-      });
-      handleEndLocal('ended');
-    } catch (error) {
-      console.error('Failed to end call:', error);
-      handleEndLocal('ended');
-    }
+    endedRef.current = true;
+    const callDuration = startTimeRef.current ? Math.floor((Date.now() - startTimeRef.current) / 1000) : 0;
+    webrtcRef.current?.endCall();
+    setCallState('ended');
+    setTimeout(() => onEnd(callDuration), 800);
   };
 
-  const handleAcceptCall = async () => {
-    try {
-      await updateDoc(doc(db, 'calls', callDocId), {
-        status: 'connected',
-        connectedAt: serverTimestamp(),
-      });
-      setCallState('connected');
-    } catch (error) {
-      console.error('Failed to accept call:', error);
-      toast.error('Unable to connect call.');
-    }
+  const handleToggleMute = () => {
+    const newMuted = !isMuted;
+    setIsMuted(newMuted);
+    webrtcRef.current?.toggleAudio(!newMuted);
   };
 
-  const handleRejectCall = async () => {
-    try {
-      await updateDoc(doc(db, 'calls', callDocId), {
-        status: 'rejected',
-        endedAt: serverTimestamp(),
-      });
-      handleEndLocal('ended');
-    } catch (error) {
-      console.error('Failed to reject call:', error);
-      handleEndLocal('ended');
-    }
+  const handleToggleCamera = () => {
+    const newCameraOff = !isCameraOff;
+    setIsCameraOff(newCameraOff);
+    webrtcRef.current?.toggleVideo(!newCameraOff);
+  };
+
+  const handleSwitchCamera = () => {
+    setIsFrontCamera(f => !f);
+    webrtcRef.current?.switchCamera();
   };
 
   return (
@@ -207,36 +171,44 @@ const CallModal = ({ user, type, callDocId, isIncoming, onEnd }: CallModalProps)
 
           <div className="text-center">
             <h2 className="text-white text-2xl font-bold">{user.name}</h2>
-            <p className={cn(
-              'text-sm mt-1.5 font-medium',
-              callState === 'connected' ? 'text-[#00FF00]' :
-                callState === 'busy' ? 'text-orange-400' :
-                  callState === 'missed' ? 'text-red-400' :
-                    'text-white/70'
-            )}>
-              {callState === 'ringing'
-                ? isIncoming ? '📞 Incoming call...' : (type === 'video' ? '📹 Video calling...' : '📞 Calling...')
-                : callState === 'connected'
-                  ? '● Connected'
-                  : callState === 'busy'
-                    ? '⚡ Line busy'
-                    : callState === 'missed'
-                      ? '✕ Call missed'
-                      : '✓ Call ended'}
+            <p className={cn('text-sm mt-1.5 font-medium', callState === 'connected' ? 'text-[#00FF00]' : 'text-white/70')}>
+              {callState === 'calling'
+                ? (type === 'video' ? '📹 Video calling...' : '📞 Calling...')
+                : callState === 'ringing'
+                  ? (type === 'video' ? '📹 Incoming video call...' : '📞 Incoming call...')
+                  : callState === 'connected'
+                    ? '● Connected'
+                    : '✓ Call ended'}
             </p>
           </div>
+
+          {/* Remote video for video calls */}
+          {type === 'video' && callState === 'connected' && (
+            <video
+              ref={remoteVideoRef}
+              autoPlay
+              playsInline
+              className="absolute inset-0 w-full h-full object-cover"
+            />
+          )}
 
           {/* Self preview for video */}
           {type === 'video' && callState === 'connected' && (
             <div className="absolute top-20 right-4 w-24 h-36 bg-[#1a1a1a] rounded-2xl border-2 border-white/20 overflow-hidden shadow-xl">
-              <div className="w-full h-full flex items-center justify-center flex-col gap-1">
-                {isCameraOff
-                  ? <CameraOff size={20} className="text-white/30" />
-                  : <Camera size={20} className="text-white/30" />}
-                <span className="text-white/30 text-[10px]">
-                  {isCameraOff ? 'Camera off' : isFrontCamera ? 'Front' : 'Rear'}
-                </span>
-              </div>
+              {isCameraOff ? (
+                <div className="w-full h-full flex items-center justify-center flex-col gap-1">
+                  <CameraOff size={20} className="text-white/30" />
+                  <span className="text-white/30 text-[10px]">Camera off</span>
+                </div>
+              ) : (
+                <video
+                  ref={localVideoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full h-full object-cover"
+                />
+              )}
             </div>
           )}
         </div>
@@ -244,19 +216,19 @@ const CallModal = ({ user, type, callDocId, isIncoming, onEnd }: CallModalProps)
         {/* Controls */}
         <div className="pb-14 px-8">
           {callState === 'connected' && (
-            <div className={cn('grid gap-4 mb-8', type === 'video' ? 'grid-cols-4' : 'grid-cols-3')}>
+            <div className={cn('grid gap-4 mb-8', type === 'video' ? 'grid-cols-4' : 'grid-cols-2')}>
               <ControlBtn
                 active={isMuted}
                 icon={isMuted ? <MicOff size={22} /> : <Mic size={22} />}
                 label={isMuted ? 'Unmute' : 'Mute'}
-                onClick={() => setIsMuted(m => !m)}
+                onClick={handleToggleMute}
               />
               {type === 'video' && (
                 <ControlBtn
                   active={isCameraOff}
                   icon={isCameraOff ? <CameraOff size={22} /> : <Camera size={22} />}
                   label={isCameraOff ? 'Camera off' : 'Camera'}
-                  onClick={() => setIsCameraOff(c => !c)}
+                  onClick={handleToggleCamera}
                 />
               )}
               <ControlBtn
@@ -265,45 +237,23 @@ const CallModal = ({ user, type, callDocId, isIncoming, onEnd }: CallModalProps)
                 label={isSpeakerOn ? 'Speaker on' : 'Speaker'}
                 onClick={() => setIsSpeakerOn(s => !s)}
               />
-              <ControlBtn
-                icon={<RotateCcw size={22} />}
-                label={type === 'video' ? (isFrontCamera ? 'Rear' : 'Front') : 'Chat'}
-                onClick={() =>
-                  type === 'video'
-                    ? setIsFrontCamera(f => !f)
-                    : toast.info('In-call chat coming soon!')
-                }
-              />
+              {type === 'video' && (
+                <ControlBtn
+                  icon={<RotateCcw size={22} />}
+                  label={isFrontCamera ? 'Rear' : 'Front'}
+                  onClick={handleSwitchCamera}
+                />
+              )}
             </div>
           )}
 
-          <div className="flex justify-center gap-10">
-            {callState === 'ringing' && isIncoming ? (
-              <>
-                <button
-                  aria-label="Reject call"
-                  onClick={handleRejectCall}
-                  className="w-16 h-16 bg-red-500 rounded-full flex items-center justify-center shadow-xl hover:bg-red-600 transition-all active:scale-95"
-                >
-                  <PhoneOff size={26} className="text-white" />
-                </button>
-                <button
-                  aria-label="Accept call"
-                  onClick={handleAcceptCall}
-                  className="w-16 h-16 bg-green-500 rounded-full flex items-center justify-center shadow-xl hover:bg-green-600 transition-all active:scale-95 animate-bounce"
-                >
-                  <Phone size={26} className="text-white" />
-                </button>
-              </>
-            ) : (
-              <button
-                aria-label="End call"
-                onClick={handleEndCall}
-                className="w-16 h-16 bg-red-500 rounded-full flex items-center justify-center shadow-xl hover:bg-red-600 transition-all active:scale-95"
-              >
-                <PhoneOff size={26} className="text-white" />
-              </button>
-            )}
+          <div className="flex justify-center">
+            <button
+              onClick={handleEnd}
+              className="w-16 h-16 bg-red-500 rounded-full flex items-center justify-center shadow-xl hover:bg-red-600 transition-all active:scale-95"
+            >
+              <PhoneOff size={26} className="text-white" />
+            </button>
           </div>
         </div>
       </div>
